@@ -1,15 +1,16 @@
-import umap
 import torch
 import argparse
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from loguru import logger
+from kneed import KneeLocator
 from typing import List, Tuple
-from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModel
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_similarity
+
+from sklearn.decomposition import PCA
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics import (
     adjusted_rand_score,
     normalized_mutual_info_score,
@@ -21,11 +22,40 @@ from sklearn.metrics import (
 
 from clustering_module.utils import constant
 from clustering_module.services.embedding_models import Embedding
-from clustering_module.services.document_extractor import Extractor
 from clustering_module.preprocessing.text_preprocessing import Preprocessing
-from clustering_module.visualize.visualizer import plot_dendrogram, visualize_clusters
 from clustering_module.preprocessing.deduplicate import filter_duplicate_documents
+from clustering_module.visualize.visualizer import plot_dendrogram, visualize_clusters
 
+
+def find_optimal_k(X, max_clusters=20):
+    """
+    Tìm số cụm bằng Elbow Method.
+    """
+    sse = []
+    n_samples = len(X)
+    max_clusters = min(max_clusters, n_samples)
+
+    k_values = range(1, max_clusters + 1)
+
+    for k in k_values:
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        kmeans.fit(X)
+        sse.append(kmeans.inertia_)
+
+    kneedle = KneeLocator(k_values, sse, curve="convex", direction="decreasing")
+    optimal_k = kneedle.knee
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(k_values, sse, 'bx-')
+    plt.axvline(x=optimal_k, color='r', linestyle='--', label=f"Optimal K = {optimal_k}")
+    plt.xlabel('Số cụm (K)')
+    plt.ylabel('Tổng bình phương sai số (SSE)')
+    plt.title('Elbow Method để tìm K')
+    plt.legend()
+    plt.show()
+
+    print(f"Số cụm tối ưu dựa trên Elbow Method: {optimal_k}")
+    return optimal_k
 
 def get_tokenizer(checkpoint: str) -> AutoTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
@@ -36,19 +66,14 @@ def get_model(checkpoint: str, device: torch.device) -> AutoModel:
     return model
 
 def load_dataset(dataset_path: str) -> Tuple[List[str], List[str], List[int]]:
-    """
-    Đọc dataset từ file CSV và trả về danh sách văn bản, tên tài liệu, và nhãn.
-    """
     df = pd.read_csv(dataset_path)
     texts = df['text'].tolist()
     document_names = [f"doc_{id}" for id in df['id']]
-
     label_mapping = {label: idx for idx, label in enumerate(df['label'].unique())}
-    
     labels = [label_mapping[label] for label in df['label']]
     return texts, document_names, labels
 
-def evaluate_clustering(true_labels: List[int], predicted_labels: List[int], embeddings: np.ndarray) -> dict:
+def evaluate_clustering(true_labels: List[int], predicted_labels: List[int]) -> dict:
     results = {}
     results['ARI'] = adjusted_rand_score(true_labels, predicted_labels)
     results['NMI'] = normalized_mutual_info_score(true_labels, predicted_labels)
@@ -61,7 +86,6 @@ def evaluate_clustering(true_labels: List[int], predicted_labels: List[int], emb
 parser = argparse.ArgumentParser(description="Document Clustering")
 parser.add_argument("--model", type=str, default="models/vietnamese-sbert", help="Model checkpoint")
 parser.add_argument("--dataset", type=str, help="Path to CSV dataset (optional)")
-parser.add_argument("--n_clusters", type=int, default=None, help="Number of clusters (optional)")
 args = parser.parse_args()
 
 def main():
@@ -72,29 +96,16 @@ def main():
         model=model,
         tokenizer=tokenizer,
         device=device,
-        pooling_type="cls",
+        pooling_type="weighted",
     )
     preprocessor = Preprocessing(
         force_text=True,
         segment=True
     )
-
-    n_clusters = args.n_clusters
-    distance_threshold = constant.DISTANCE_THRESHOLD
-    if n_clusters is not None:
-        distance_threshold = None
-    else:
-        n_clusters = None
-    logger.info(f"Clustering params: n_clusters={n_clusters}, distance_threshold={distance_threshold}")
-    
-    texts = []
-    document_names = []
-    true_labels = []
-    
     texts, document_names, true_labels = load_dataset(args.dataset)
     
     unique_labels = set(true_labels)
-    print(f"\nCó {len(unique_labels)} nhãn khác nhau trong dữ liệu.")
+    logger.info(f"\nCó {len(unique_labels)} nhãn khác nhau trong dữ liệu.")
     
     if len(texts) < 1:
         print("Không có tài liệu hợp lệ để xử lý.")
@@ -102,6 +113,8 @@ def main():
 
     doc_embeddings = []
     valid_indices = []
+    
+    logger.info("Đang embed tài liệu...")
     for idx, text in enumerate(tqdm(texts, desc="Generating embeddings")):
         try:
             text = preprocessor.preprocess(text)
@@ -140,45 +153,34 @@ def main():
 
     X = np.stack(doc_embeddings)
     
-    # reducing dimensionality
-    # X = umap.UMAP(
-    #     n_components=100,
-    #     n_neighbors=10,
-    #     random_state=42,
-    # ).fit_transform(X)
-
-    X = PCA(
-        n_components=None,
-        svd_solver='full',
-        random_state=42
-    ).fit_transform(X)
-
-    # Hierarchical Clustering
-    print("\nKết quả phân cụm bằng Hierarchical Clustering:")
+    n_components = min(len(doc_embeddings) - 1, 200)
+    pca = PCA(n_components=n_components, random_state=42)
+    X = pca.fit_transform(X)
+    
+    max_clusters = 20
+    n_clusters = find_optimal_k(X, max_clusters)
+    
+    logger.info(f"Number of clusters found: {n_clusters}")
+    
     clustering = AgglomerativeClustering(
         n_clusters=n_clusters,
-        distance_threshold=distance_threshold,
         linkage='average',
         metric='cosine'
     )
+    
     labels = clustering.fit_predict(X)
+    print(f"Số cụm được tìm thấy: {len(set(labels)) - (1 if -1 in labels else 0)}")
+    print(f"Số tài liệu không thuộc cụm nào: {list(labels).count(-1)}")
 
-    # Evaluate clustering
-    if args.dataset and any(lbl != -1 for lbl in true_labels):
-        print("\nĐánh giá thuật toán phân cụm:")
-        eval_results = evaluate_clustering(true_labels, labels, X)
-        print(f"Adjusted Rand Index (ARI): {eval_results['ARI']:.4f}")
-        print(f"Normalized Mutual Information (NMI): {eval_results['NMI']:.4f}")
-        print(f"Fowlkes-Mallows Index (FMI): {eval_results['FMI']:.4f}")
-        print(f"Homogeneity: {eval_results['Homogeneity']:.4f}")
-        print(f"Completeness: {eval_results['Completeness']:.4f}")
-        print(f"V-measure: {eval_results['V-measure']:.4f}")
-        print(f"Silhouette Score: {eval_results['Silhouette']:.4f}")
+    eval_results = evaluate_clustering(true_labels, labels)
+    print(f"Adjusted Rand Index (ARI): {eval_results['ARI']:.4f}")
+    print(f"Normalized Mutual Information (NMI): {eval_results['NMI']:.4f}")
+    print(f"Fowlkes-Mallows Index (FMI): {eval_results['FMI']:.4f}")
+    print(f"Homogeneity: {eval_results['Homogeneity']:.4f}")
+    print(f"Completeness: {eval_results['Completeness']:.4f}")
+    print(f"V-measure: {eval_results['V-measure']:.4f}")
 
-    # Trực quan hóa các cụm
     visualize_clusters(X, labels, true_labels, document_names, "Document Clusters")
-
-    # Dendrogram
     plot_dendrogram(X, document_names, constant.DISTANCE_THRESHOLD)
 
 if __name__ == "__main__":

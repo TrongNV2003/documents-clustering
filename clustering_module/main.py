@@ -6,9 +6,11 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 from loguru import logger
+from kneed import KneeLocator
+import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from transformers import AutoTokenizer, AutoModel
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 
 from clustering_module.utils import constant
@@ -27,12 +29,42 @@ def get_model(checkpoint: str, device: torch.device) -> AutoModel:
     model = AutoModel.from_pretrained(checkpoint).to(device)
     return model
 
+
+def find_optimal_k(X, max_clusters=20):
+    """
+    Tìm số cụm bằng Elbow Method.
+    """
+    sse = []
+    n_samples = len(X)
+    max_clusters = min(max_clusters, n_samples)
+
+    k_values = range(1, max_clusters + 1)
+    
+    for k in k_values:
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        kmeans.fit(X)
+        sse.append(kmeans.inertia_)
+
+    kneedle = KneeLocator(k_values, sse, curve="convex", direction="decreasing")
+    optimal_k = kneedle.knee
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(k_values, sse, 'bx-')
+    plt.axvline(x=optimal_k, color='r', linestyle='--', label=f"Optimal K = {optimal_k}")
+    plt.xlabel('Số cụm (K)')
+    plt.ylabel('Tổng bình phương sai số (SSE)')
+    plt.title('Elbow Method để tìm K')
+    plt.legend()
+    plt.show()
+
+    print(f"Số cụm tối ưu dựa trên Elbow Method: {optimal_k}")
+    return optimal_k
+
 parser = argparse.ArgumentParser(description="Document Clustering")
 parser.add_argument("--model", type=str, default="models/vietnamese-sbert", help="Model checkpoint", required=True)
 parser.add_argument("--documents_dir", type=str, default="documents", help="Directory containing documents", required=True)
 parser.add_argument("--is_deduplicate", action="store_true", default=False, help="Enable deduplication")
-parser.add_argument("--n_clusters", type=int, default=None, help="Number of clusters (optional)")
-
+parser.add_argument("--max_clusters", type=int, default=15, help="Max of clusters for Elbow Method")
 args = parser.parse_args()
 
 def main():
@@ -43,7 +75,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         device=device,
-        pooling_type="cls", 
+        pooling_type="weighted", 
     )
     preprocessor = Preprocessing(
         force_text=True,
@@ -61,8 +93,9 @@ def main():
         print("Required at least 2 documents to cluster.")
         return
 
-    doc_embeddings = []
-    document_names = []
+    doc_embeddings, document_names = [], []
+    
+    logger.info("Đang embed tài liệu...")
     for path in tqdm(documents, desc="Embedding docs"):
         try:
             raw = extractor.extract_document(path)
@@ -74,8 +107,8 @@ def main():
             vec = embedding_model.embed_document(preprocessed_doc)
             
             if vec is None or not np.any(vec):
-                    print(f"Skipped document: '{os.path.basename(path)}': Failed to generate embedding.")
-                    continue
+                print(f"Skipped document: '{os.path.basename(path)}': Failed to generate embedding.")
+                continue
             doc_embeddings.append(vec)
             document_names.append(os.path.basename(path))
         
@@ -95,22 +128,13 @@ def main():
 
     X = np.stack(doc_embeddings)
     
-    # reducing dimensionality
-    n_neighbors = min(5, len(doc_embeddings) - 1)
-    print(n_neighbors)
+    n_components = min(len(doc_embeddings) - 1, 100)
+    pca = PCA(n_components=n_components, random_state=42)
+    X = pca.fit_transform(X)
     
-    # X = umap.UMAP(
-    #     n_components=3,
-    #     n_neighbors=n_neighbors,
-    #     random_state=42,
-    # ).fit_transform(X)
-    
-    # Reducing dimensionality using PCA
-    X = PCA(
-        n_components=None,
-        svd_solver='full',
-        random_state=42
-    ).fit_transform(X)
+    if len(X) < 2:
+        print("Không đủ tài liệu để phân cụm. Cần ít nhất 2 tài liệu.")
+        return
     
     if len(document_names) >= 2:
         print("\nCosine Similarity giữa các tài liệu:")
@@ -125,28 +149,22 @@ def main():
     else:
         print("Không đủ tài liệu để tính toán cosine similarity.")
 
-    n_clusters = args.n_clusters
-    distance_threshold = constant.DISTANCE_THRESHOLD
-    if n_clusters is not None:
-        distance_threshold = None
-    else:
-        n_clusters = None
-    logger.info(f"Clustering params: n_clusters={n_clusters}, distance_threshold={distance_threshold}")
+    n_clusters = find_optimal_k(X, args.max_clusters)
 
-    print("\nKết quả phân cụm bằng Hierarchical Clustering:")
+    logger.info(f"Clustering params: n_clusters={n_clusters}")
+
     clustering = AgglomerativeClustering(
         n_clusters=n_clusters,
-        distance_threshold=distance_threshold,
         linkage='average',
         metric='cosine'
     )
+    
     labels = clustering.fit_predict(X)
     for name, lbl in zip(document_names, labels):
         print(f"{name} → Cluster {lbl}")
 
-    # Vẽ dendrogram
     plot_dendrogram(X, document_names, constant.DISTANCE_THRESHOLD)
-    
 
+    
 if __name__ == "__main__":
     main()
