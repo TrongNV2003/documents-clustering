@@ -153,7 +153,7 @@ def main():
 
     X = np.stack(doc_embeddings)
     
-    n_components = min(len(doc_embeddings) - 1, 200)
+    n_components = min(len(doc_embeddings) - 1, 100)
     pca = PCA(n_components=n_components, random_state=42)
     X = pca.fit_transform(X)
     
